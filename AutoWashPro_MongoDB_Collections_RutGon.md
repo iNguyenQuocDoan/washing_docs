@@ -1,9 +1,13 @@
 # AutoWash Pro — MongoDB Collection Design Rút Gọn
 
-**Phiên bản:** 1.0  
+**Phiên bản:** 1.1  
 **Mục tiêu:** Liệt kê collections và trường dữ liệu để vẽ MongoDB diagram / ERD-style.  
 **Phạm vi:** Advance Booking, Wash Operation, Inspection, Payment, Loyalty, Promotion.  
 **Quyết định:** Dùng `roles` + `users`, không dùng `user_roles`; hạn chế nhúng object nghiệp vụ quan trọng.
+
+**Changelog:**
+- **1.1** — Thêm collection `service_pricing` (#22) để tách ma trận giá theo loại xe khỏi `service_types`. `service_types.base_price` xuống vai trò giá đề xuất. Thêm BR-29 → BR-32. Cập nhật flow §5.2 và §5.3.
+- **1.0** — Bản gốc, 21 collections.
 
 ---
 
@@ -43,6 +47,7 @@
 | 19 | `promotion_services` | Mapping promotion với service áp dụng. |
 | 20 | `promotion_valid_days` | Lưu ngày trong tuần promotion được áp dụng. |
 | 21 | `promotion_usages` | Lưu lịch sử sử dụng promotion. |
+| 22 | `service_pricing` | Ma trận giá theo cặp (dịch vụ, loại xe). Là nguồn giá chính khi đặt lịch và check-in. |
 
 ---
 ## 3. Chi tiết collections
@@ -154,12 +159,14 @@ code = customer | cashier | washer | manager | admin
 
 **Mục đích:** Lưu gói dịch vụ rửa xe và thông tin tính điểm.
 
+> **Lưu ý về giá:** `base_price` ở đây chỉ là **giá đề xuất/gợi ý** dùng khi seed ma trận giá ban đầu. Giá thực tế khi đặt lịch và check-in lấy từ collection `service_pricing` (xem §3.22) — vì giá rửa xe khác nhau theo loại xe (xe máy / sedan / SUV).
+
 | Field | Type | Required | Reference | Mô tả |
 |---|---:|:---:|---|---|
 | `_id` | `ObjectId` | Yes | `—` | ID dịch vụ |
 | `name` | `String` | Yes | `—` | Tên dịch vụ |
 | `description` | `String` | No | `—` | Mô tả |
-| `base_price` | `Decimal128` | Yes | `—` | Giá gốc |
+| `base_price` | `Decimal128` | Yes | `—` | Giá đề xuất (fallback, không phải nguồn truth khi booking) |
 | `estimated_minutes` | `Number` | Yes | `—` | Thời lượng dự kiến |
 | `points_multiplier` | `Number` | Yes | `—` | Hệ số điểm |
 | `is_active` | `Boolean` | Yes | `—` | Còn bán |
@@ -663,6 +670,35 @@ status = reserved | used | cancelled
 
 ---
 
+## 3.22 `service_pricing`
+
+**Mục đích:** Ma trận giá theo cặp (dịch vụ × loại xe). Là nguồn giá chính khi customer xem giá lúc đặt lịch và khi cashier check-in. Tách khỏi `service_types` vì cùng 1 dịch vụ "Rửa cơ bản" có giá khác nhau cho xe máy / sedan / SUV.
+
+| Field | Type | Required | Reference | Mô tả |
+|---|---:|:---:|---|---|
+| `_id` | `ObjectId` | Yes | `—` | ID pricing row |
+| `service_type_id` | `ObjectId` | Yes | `service_types._id` | Dịch vụ |
+| `vehicle_type_id` | `ObjectId` | Yes | `vehicle_types._id` | Loại xe |
+| `price` | `Decimal128` | Yes | `—` | Giá thực tế cho cặp |
+| `is_active` | `Boolean` | Yes | `—` | Pricing còn hiệu lực |
+| `created_at` | `Date` | Yes | `—` | Ngày tạo |
+| `updated_at` | `Date` | Yes | `—` | Ngày cập nhật |
+
+**Index đề xuất:**
+
+```js
+{ service_type_id: 1, vehicle_type_id: 1 } unique; { vehicle_type_id: 1, is_active: 1 }
+```
+
+**Quy tắc:**
+
+- Mỗi cặp `(service_type_id, vehicle_type_id)` chỉ có **1 row** (unique compound, áp dụng cho cả `is_active=false`).
+- Update chỉ cho đổi `price` và `is_active`, KHÔNG cho đổi cặp ref (xóa mềm + tạo mới nếu cần).
+- Soft delete dùng `is_active=false`, không xóa cứng.
+- Khi `service_types` hoặc `vehicle_types` bị set inactive, các row `service_pricing` liên quan **giữ nguyên** (orphan-tolerant). Booking layer filter `is_active=true` ở cả 3 collection để ẩn pair khỏi flow đặt lịch.
+
+---
+
 ## 4. Quan hệ chính để vẽ diagram
 
 ```txt
@@ -670,6 +706,9 @@ roles 1 ─── N users
 
 users 1 ─── N vehicles
 vehicle_types 1 ─── N vehicles
+
+service_types 1 ─── N service_pricing
+vehicle_types 1 ─── N service_pricing
 
 users 1 ─── N bookings
 vehicles 1 ─── N bookings
@@ -724,6 +763,7 @@ wash_sessions 1 ─── 0..1 promotion_usages
 ### 5.2 Đặt lịch trước
 
 - Customer chọn xe, dịch vụ và thời gian.
+- Hệ thống lookup giá thực tế từ `service_pricing` theo cặp `(service_type_id, vehicle_type_id)`. Nếu không có row active cho cặp đó → từ chối booking (dịch vụ chưa hỗ trợ loại xe này).
 - Hệ thống kiểm tra tier từ `loyalty_accounts` + `tier_configs`.
 - Hệ thống kiểm tra booking window, số booking chưa hoàn thành và capacity của `staff_shifts`.
 - Tạo `bookings` với `priority_level` theo tier.
@@ -731,7 +771,8 @@ wash_sessions 1 ─── 0..1 promotion_usages
 ### 5.3 Check-in và tạo wash session
 
 - Cashier tìm booking theo phone, biển số hoặc booking ID.
-- Nếu có booking thì confirm; nếu walk-in thì tạo `wash_sessions.booking_id = null`.
+- Nếu có booking thì confirm; nếu walk-in thì tạo `wash_sessions.booking_id = null`. Walk-in cũng lookup giá từ `service_pricing` theo cặp `(service_type_id, vehicle_type_id)` của xe được rửa.
+- Chốt `wash_sessions.service_price_snapshot` = giá lấy từ `service_pricing.price` tại thời điểm check-in (snapshot, không bị ảnh hưởng nếu admin sửa pricing sau đó).
 - Cashier tạo inspection before và ảnh trong `inspection_photos`.
 - Cashier verify promotion và gán washer.
 
@@ -809,6 +850,10 @@ wash_sessions 1 ─── 0..1 promotion_usages
 | BR-26 | Promotion phải đúng tier, thời gian, service, valid day, quota và eligibility. |
 | BR-27 | `promotion_usages.wash_session_id` unique. |
 | BR-28 | Manual tier adjust phải ghi `tier_histories`. |
+| BR-29 | Mỗi cặp `(service_type_id, vehicle_type_id)` chỉ có duy nhất 1 row trong `service_pricing`. |
+| BR-30 | Booking và walk-in check-in phải có row `service_pricing` active cho cặp `(service_type, vehicle_type)`; thiếu → từ chối tạo. |
+| BR-31 | `wash_sessions.service_price_snapshot` chốt từ `service_pricing.price` tại thời điểm check-in, không cập nhật lại nếu pricing thay đổi sau đó. |
+| BR-32 | `service_types.base_price` chỉ là giá đề xuất; nguồn truth khi giao dịch là `service_pricing`. |
 
 ## 7. Collections không đưa vào sơ đồ rút gọn
 
@@ -828,6 +873,11 @@ wash_sessions 1 ─── 0..1 promotion_usages
 ```txt
 [User & Vehicle]
 roles → users → vehicles → vehicle_types
+
+[Catalog & Pricing]
+service_types ─┐
+               ├→ service_pricing
+vehicle_types ─┘
 
 [Booking & Operation]
 users → bookings → wash_sessions
@@ -853,4 +903,4 @@ promotions → promotion_usages → wash_sessions
 
 ## 9. Kết luận
 
-Bản thiết kế này dùng **21 collections** để vẽ MongoDB collection diagram rút gọn nhưng vẫn giữ đủ nghiệp vụ chính: **Customer → Vehicle → Booking → Wash Session → Inspection → Payment → Loyalty → Promotion**.
+Bản thiết kế này dùng **22 collections** để vẽ MongoDB collection diagram rút gọn nhưng vẫn giữ đủ nghiệp vụ chính: **Customer → Vehicle → Booking → Wash Session → Inspection → Payment → Loyalty → Promotion**, với ma trận giá theo loại xe qua `service_pricing` (thêm so với phiên bản 21-collection ban đầu để phản ánh đúng nghiệp vụ giá rửa xe khác nhau cho từng loại xe).
