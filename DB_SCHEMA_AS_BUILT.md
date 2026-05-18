@@ -411,44 +411,19 @@ payment_transactions N─1 orders
 
 ---
 
-## Collections MỚI cần thêm (theo audit nghiệp vụ — chưa có ở spec gốc)
+## Field cần BỔ SUNG cho MVP (audit lean)
 
-Xem chi tiết trong [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md) §4.
+Xem chi tiết trong [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md). Chỉ thêm tối thiểu để chạy nghiệp vụ — KHÔNG over-engineer.
 
-| Collection | Mục đích | Ưu tiên |
-|---|---|:---:|
-| `wash_steps` | 5 bước rửa con (pre_wash → final_check) cho mỗi wash_session | **P1** |
-| `status_history` | Polymorphic audit log cho mọi transition của booking/wash_session/order | **P2** |
+### `bookings` — thêm 4 field
+- `payment_status` enum {`unpaid`,`paid`}, default `unpaid`
+- `payment_method` enum {`cash`,`online`}, nullable
+- `paid_at` (Date), nullable
+- `final_price` (Decimal128), nullable — snapshot lúc đóng đơn
 
----
+### `orders` — thêm 1 field
+- `booking_id` FK→bookings, **sparse UQ** — link Order PayOS với Booking
 
-## Field cần BỔ SUNG vào collection hiện có (audit P1/P2)
+**Tổng cộng: 5 field mới, 0 collection mới, 0 status mới.**
 
-### `bookings` (P1)
-- `estimated_price`, `final_price` (Decimal128)
-- `payment_status` enum {`unpaid`,`paid`,`refunded`}
-- `payment_method` enum {`cash`,`online`}
-- `paid_at` (Date)
-- `order_id` FK→orders (sparse)
-- `wash_session_id` FK→wash_sessions
-- `checked_in_at`, `verified_by_cashier_id`
-- `closed_at`, `closed_by_cashier_id`
-- **Status enum mới:** thêm `CHECKED_IN`, `QUALITY_CHECK`, `COMPLETED`, `CLOSED`, `NEEDS_REWORK`, `REFUNDED`
-
-### `wash_sessions` (P2)
-- `assigned_at` (Date)
-- `quality_check_at`, `quality_check_by_id`, `quality_check_result` enum {`approved`,`rework`}
-- `rework_count` (Number, default 0)
-- **Status enum mới:** `QUALITY_CHECK`, `NEEDS_REWORK`
-
-### `orders` (P1)
-- `booking_id` FK→bookings (sparse UQ)
-- `wash_session_id` FK→wash_sessions
-- `paid_at` (Date)
-- **Status enum mới:** `REFUNDED`
-
-### `vehicle_types` (P2)
-- `price_multiplier` (Number, default 1.0) — để loại xe ảnh hưởng giá
-
-### `inspections` (P2)
-- `is_required_gate` (Boolean) — bắt buộc inspection BEFORE trước khi washer `/start`
+> Backlog enterprise (wash_steps, status_history, quality_check, vehicle_type multiplier, refund flow) đã bị loại khỏi scope MVP — xem [BUSINESS_FLOW_AUDIT.md §5](./BUSINESS_FLOW_AUDIT.md) nếu cần sau này.

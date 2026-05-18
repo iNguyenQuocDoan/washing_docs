@@ -5,7 +5,7 @@
 **Current branch:** `feature/wash-sessions`
 **Spec reference:** `docs/AutoWashPro_MongoDB_Collections_RutGon.md` (21 collections)
 
-> 📋 **Audit nghiệp vụ E2E:** xem [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md) — đáp ứng ~60–65% luồng chuẩn. Phần thiếu chính: liên kết Booking↔Payment, wash sub-steps, quality-check, close/refund flow.
+> 📋 **Audit nghiệp vụ E2E (lean MVP):** xem [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md). Gap duy nhất P1: liên kết Booking↔Order PayOS + endpoint cashier xác nhận thanh toán. Fix = 5 field mới + 1 endpoint, ước ~1 ngày.
 
 > Dùng tài liệu này khi thiết kế DB diagram để biết collection nào đã build, deviation nào so với spec, và phase nào sắp tới.
 
@@ -21,15 +21,13 @@
 | 4 | `vehicles` | ✅ Done | `feature/vehicles` (pushed, chờ merge) | Xem deviation §2 dưới |
 | 5 | `service_types` | ✅ Done | merged `feature/service-types` | Admin/manager CRUD; public read |
 | 6 | `staff_shifts` | ✅ Done | `feature/staff-shifts` (pushed, chờ merge) | Manager CRUD + atomic `$inc` cho capacity, state machine scheduled→active→completed |
-| 7 | `bookings` | ✅ Done | `feature/bookings` (pushed, chờ merge) | Main flow — atomic capacity, tier window check, state machine, cashier search phone/plate, customer `note` field (D-04), service-duration fit check (D-05). ⚠ Audit: thiếu payment fields + `CHECKED_IN`/`QUALITY_CHECK`/`CLOSED` |
-| 8 | `wash_sessions` | 🟢 Built (untracked) | `feature/wash-sessions` (LOCAL only) | Cashier mở phiên / walk-in; assign washer; washer start/complete; auto-sync booking. ⚠ Audit: thiếu sub-step, quality-check |
-| 9 | `inspections` | 🟢 Built (untracked) | `feature/wash-sessions` (LOCAL only) | Before/after phase, unique per session, customer acknowledgement + signature URL |
-| 10 | `inspection_photos` | 🟢 Built (untracked) | `feature/wash-sessions` (LOCAL only) | URL-based (Cloudinary/S3), max 10MB |
-| 11 | `orders` (PayOS) | ⚠ Built nhưng rời | branch local | PayOS checkout + webhook. ⚠ Audit P1: KHÔNG liên kết booking/wash_session |
+| 7 | `bookings` | ✅ Done | merged `feature/bookings` | Main flow — atomic capacity, tier window, state machine, cashier search phone/plate, customer `note` (D-04), service-duration fit (D-05). ⚠ Audit lean: thiếu 4 field payment (`payment_status`, `payment_method`, `paid_at`, `final_price`) |
+| 8 | `wash_sessions` | ✅ Done | merged `feature/wash-sessions` (commit `31e67a2`) | Cashier mở phiên / walk-in; assign washer; washer start/complete; auto-sync booking |
+| 9 | `inspections` | ✅ Done | merged `feature/wash-sessions` | Before/after phase, unique per session, customer acknowledgement + signature URL |
+| 10 | `inspection_photos` | ✅ Done | merged `feature/wash-sessions` | URL-based (Cloudinary/S3), max 10MB |
+| 11 | `orders` (PayOS) | ⚠ Built nhưng rời | branch local | PayOS checkout + webhook. ⚠ Audit P1: thiếu `booking_id` link |
 | 12 | `payment_transactions` | ✅ Built | branch local | Audit log PayOS webhook |
-| 13 | `wash_steps` | ❌ **CẦN THÊM (P1)** | — | Sub-step rửa: pre_wash / exterior / interior / drying / final_check |
-| 14 | `cash_sessions` | ❌ Phase sau | — | Phase 8+ (quản lý ca thu ngân) |
-| 15 | `status_history` | ❌ **CẦN THÊM (P2)** | — | Polymorphic audit log cho transitions |
+| 13 | `cash_sessions` | ❌ Phase sau | — | Phase 8+ (quản lý ca thu ngân) — optional cho MVP |
 | 13 | `loyalty_accounts` | ✅ Done | `feature/loyalty-accounts` (pushed, chờ merge) | Auto-create khi customer register (Member tier), lazy-create cho user cũ |
 | 14 | `tier_configs` | ✅ Done | `feature/tier-configs` (pushed, chờ merge) | 4 tier auto-seed: Member(prio=0,win=3,pts=10) / Silver(prio=1,win=7,pts=15) / Gold(prio=2,win=14,pts=20) / Platinum(prio=3,win=30,pts=30) |
 | 15 | `tier_histories` | ❌ Phase sau | — | Phase 9+ (loyalty math) |
