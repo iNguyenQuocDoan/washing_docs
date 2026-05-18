@@ -1,6 +1,10 @@
 # Database Schema — As Built
 
-**Mục đích:** Bản schema thực tế của 9 collections đã code, để vẽ ERD/DB diagram bằng tay.
+**Last update:** 2026-05-18 (thêm wash_sessions, inspections, inspection_photos, orders, payment_transactions)
+
+> ⚠ Đã có audit nghiệp vụ end-to-end → xem [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md) cho danh sách field/collection còn thiếu so với luồng nghiệp vụ chuẩn.
+
+**Mục đích:** Bản schema thực tế của 14 collections đã code, để vẽ ERD/DB diagram bằng tay.
 
 **Quy ước:**
 - 🟢 = đúng spec docs §3.x
@@ -200,6 +204,115 @@
 
 ---
 
+## 10. `wash_sessions` 🆕 (branch `feature/wash-sessions`, untracked tại thời điểm audit)
+
+| Field | Type | Constraint | Note |
+|---|---|---|---|
+| `_id` | ObjectId | PK | |
+| `booking_id` | ObjectId | optional, IX, **FK→bookings** | Null cho walk-in |
+| `customer_id` | ObjectId | required, IX, **FK→users** | |
+| `vehicle_id` | ObjectId | required, IX, **FK→vehicles** | |
+| `service_type_id` | ObjectId | required, IX, **FK→service_types** | |
+| `cashier_id` | ObjectId | required, IX, **FK→users** | Cashier mở phiên |
+| `washer_id` | ObjectId | optional, IX, **FK→users** | Set khi assign |
+| `service_price_snapshot` | Decimal128 | required | Snapshot base_price lúc mở phiên |
+| `status` | String | required, IX, enum, default `waiting` | `waiting`→`assigned`→`in_progress`→`done`; hoặc `cancelled` |
+| `started_at` | Date | optional | Khi washer `/start` |
+| `completed_at` | Date | optional | Khi washer `/complete` |
+| `note` | String | optional, max 500 | Ghi chú khi mở phiên |
+| `cancel_reason` | String | optional | |
+| `created_at` | Date | auto | |
+| `updated_at` | Date | auto | |
+
+**Indexes:**
+- `{ cashier_id: 1, created_at: -1 }` compound
+- `{ washer_id: 1, started_at: -1 }` compound
+- `{ vehicle_id: 1, created_at: -1 }` compound
+
+**Quy tắc:** 1 booking ↔ ≤ 1 wash_session (check ở service, chưa có unique index).
+
+⚠ **Thiếu (xem audit):** `assigned_at`, `quality_check_at`, `quality_check_by_id`, `quality_check_result`, `rework_count`. Status enum thiếu `QUALITY_CHECK`, `NEEDS_REWORK`.
+
+---
+
+## 11. `inspections` 🆕
+
+| Field | Type | Constraint | Note |
+|---|---|---|---|
+| `_id` | ObjectId | PK | |
+| `wash_session_id` | ObjectId | required, IX, **FK→wash_sessions** | |
+| `inspector_id` | ObjectId | required, IX, **FK→users** | Cashier ghi nhận |
+| `phase` | String | required, enum | `before` (xe vào) hoặc `after` (xe ra) |
+| `damage_notes` | String | optional, max 1000 | Ghi nhận vết xước/hỏng |
+| `customer_acknowledged` | Boolean | required, default `false` | Khách đã xác nhận |
+| `customer_signature_url` | String | optional | URL chữ ký |
+| `created_at` | Date | auto | |
+| `updated_at` | Date | auto | |
+
+**Indexes:**
+- `{ wash_session_id: 1, phase: 1 }` **UQ** (mỗi session ≤ 1 inspection per phase)
+- `{ inspector_id: 1, created_at: -1 }` compound
+
+⚠ **Thiếu:** flag `is_required_gate` (bắt buộc inspection BEFORE thì washer mới `/start` được — hiện chỉ optional).
+
+---
+
+## 12. `inspection_photos` 🆕
+
+| Field | Type | Constraint | Note |
+|---|---|---|---|
+| `_id` | ObjectId | PK | |
+| `inspection_id` | ObjectId | required, IX, **FK→inspections** | |
+| `photo_url` | String | required, max 500 | Cloudinary/S3 URL |
+| `mime` | String | required, enum | `image/jpeg`, `image/png`, `image/webp` |
+| `size` | Number | required, min 1, max 10_000_000 | Bytes (max 10MB) |
+| `uploaded_at` | Date | auto (createdAt) | |
+
+---
+
+## 13. `orders` 🆕 (PayOS — chạy SONG SONG với bookings, chưa liên kết)
+
+| Field | Type | Constraint | Note |
+|---|---|---|---|
+| `_id` | ObjectId | PK | |
+| `customer_id` | ObjectId | required, IX, **FK→users** | |
+| `vehicle_id` | ObjectId | required, **FK→vehicles** | |
+| `service_type_id` | ObjectId | required, **FK→service_types** | |
+| `order_code` | Number | required, UQ, IX | Code gửi PayOS |
+| `amount` | Number | required | VND (integer, làm tròn base_price) |
+| `description` | String | required, maxlen 25 | "Rua xe <code>" |
+| `status` | String | enum, default `PENDING`, IX | `PENDING`, `PAID`, `CANCELLED`, `EXPIRED` |
+| `checkout_url` | String | optional | URL PayOS trả về |
+| `payment_link_id` | String | optional | ID nội bộ PayOS |
+| `notes` | String | optional | |
+| `created_at` | Date | auto | |
+| `updated_at` | Date | auto | |
+
+**Indexes:**
+- `{ customer_id: 1, status: 1 }` compound
+- `{ customer_id: 1, created_at: -1 }` compound
+
+⚠ **VẤN ĐỀ LỚN (audit P1):** thiếu `booking_id`, `wash_session_id`, `paid_at` → không liên kết với booking/wash. Thiếu status `REFUNDED`.
+
+---
+
+## 14. `payment_transactions` 🆕
+
+| Field | Type | Constraint | Note |
+|---|---|---|---|
+| `_id` | ObjectId | PK | |
+| `order_id` | ObjectId | required, IX, **FK→orders** | |
+| `order_code` | Number | required, IX | Denormalized cho lookup nhanh |
+| `payos_transaction_id` | String | optional | Reference từ PayOS |
+| `amount` | Number | required | |
+| `status` | String | required | Description/desc/code từ PayOS webhook |
+| `raw_data` | Object | optional | Toàn bộ payload webhook (audit) |
+| `transaction_datetime` | Date | optional | Time PayOS confirm |
+| `created_at` | Date | auto | |
+| `updated_at` | Date | auto | |
+
+---
+
 ## Quan hệ chính (để vẽ diagram)
 
 ```
@@ -216,6 +329,25 @@ bookings:
   vehicle_id       → vehicles
   service_type_id  → service_types
   staff_shift_id   → staff_shifts
+
+wash_sessions:
+  booking_id       → bookings (nullable, walk-in = null)
+  customer_id      → users
+  vehicle_id       → vehicles
+  service_type_id  → service_types
+  cashier_id       → users (role=cashier)
+  washer_id        → users (role=washer, nullable trước assign)
+
+inspections N─1 wash_sessions
+inspection_photos N─1 inspections
+
+orders (PayOS) — chạy SONG SONG, chưa liên kết:
+  customer_id      → users
+  vehicle_id       → vehicles
+  service_type_id  → service_types
+  (⚠ thiếu booking_id / wash_session_id)
+
+payment_transactions N─1 orders
 ```
 
 ```
@@ -269,19 +401,54 @@ bookings:
 
 ---
 
-## Collections còn lại theo spec (CHƯA build, sẽ vẽ riêng nếu cần)
+## Collections còn lại theo spec (CHƯA build)
 
-10. `inspections`
-11. `inspection_photos`
-12. `wash_sessions`
-13. `payments`
-14. `cash_sessions`
-15. `tier_histories`
-16. `point_transactions`
-17. `point_ledgers`
-18. `promotions`
-19. `promotion_services`
-20. `promotion_valid_days`
-21. `promotion_usages`
+- `cash_sessions` (Phase 8 — quản lý ca trực thu ngân)
+- `tier_histories` (Phase 9 — lịch sử lên/xuống hạng loyalty)
+- `point_transactions` (Phase 9 — earn/redeem)
+- `point_ledgers` (Phase 9 — FIFO redemption)
+- `promotions`, `promotion_services`, `promotion_valid_days`, `promotion_usages` (Phase 10 — khuyến mãi)
 
-Khi vẽ ERD lần đầu, có thể tạm bỏ 12 collection này hoặc vẽ placeholder, focus vào 9 collection trên đã chạy được.
+---
+
+## Collections MỚI cần thêm (theo audit nghiệp vụ — chưa có ở spec gốc)
+
+Xem chi tiết trong [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md) §4.
+
+| Collection | Mục đích | Ưu tiên |
+|---|---|:---:|
+| `wash_steps` | 5 bước rửa con (pre_wash → final_check) cho mỗi wash_session | **P1** |
+| `status_history` | Polymorphic audit log cho mọi transition của booking/wash_session/order | **P2** |
+
+---
+
+## Field cần BỔ SUNG vào collection hiện có (audit P1/P2)
+
+### `bookings` (P1)
+- `estimated_price`, `final_price` (Decimal128)
+- `payment_status` enum {`unpaid`,`paid`,`refunded`}
+- `payment_method` enum {`cash`,`online`}
+- `paid_at` (Date)
+- `order_id` FK→orders (sparse)
+- `wash_session_id` FK→wash_sessions
+- `checked_in_at`, `verified_by_cashier_id`
+- `closed_at`, `closed_by_cashier_id`
+- **Status enum mới:** thêm `CHECKED_IN`, `QUALITY_CHECK`, `COMPLETED`, `CLOSED`, `NEEDS_REWORK`, `REFUNDED`
+
+### `wash_sessions` (P2)
+- `assigned_at` (Date)
+- `quality_check_at`, `quality_check_by_id`, `quality_check_result` enum {`approved`,`rework`}
+- `rework_count` (Number, default 0)
+- **Status enum mới:** `QUALITY_CHECK`, `NEEDS_REWORK`
+
+### `orders` (P1)
+- `booking_id` FK→bookings (sparse UQ)
+- `wash_session_id` FK→wash_sessions
+- `paid_at` (Date)
+- **Status enum mới:** `REFUNDED`
+
+### `vehicle_types` (P2)
+- `price_multiplier` (Number, default 1.0) — để loại xe ảnh hưởng giá
+
+### `inspections` (P2)
+- `is_required_gate` (Boolean) — bắt buộc inspection BEFORE trước khi washer `/start`
