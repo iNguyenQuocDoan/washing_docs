@@ -1,5 +1,15 @@
 # Business Flow Audit — Car Washing Booking (Lean MVP)
 
+> ⚠️ **ARCHIVED — 2026-05-19**
+>
+> Tài liệu này audit branch `feature/wash-sessions` (Booking + WashSession + Order rời nhau) và đề xuất link `Booking ↔ Order`.
+>
+> **`main` đã giải quyết khác:** gộp Booking + Payment vào 1 entity `Order` duy nhất. Gap P1 đề cập dưới đây **không còn hiệu lực**.
+>
+> Đọc [BOOKING_FLOW.md](./BOOKING_FLOW.md) cho luồng nghiệp vụ hiện hành. Giữ file này lại làm context lịch sử về quyết định kiến trúc.
+
+---
+
 **Ngày audit:** 2026-05-18
 **Branch:** `feature/wash-sessions`
 **So sánh với:** `origin/main` (rev `da6557c`)

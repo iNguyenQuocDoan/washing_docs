@@ -1,435 +1,389 @@
-# Booking Business Flow — End-to-End
+# Booking Flow — End-to-End
 
-**Phạm vi:** Mô tả đầy đủ luồng nghiệp vụ Booking — từ lúc Customer chọn gói đến khi Cashier đóng đơn — và map sang code thực tế.
-**Branch tham chiếu:** `feature/wash-sessions` (`31e67a2`)
-**Last update:** 2026-05-18
+**Phạm vi:** Mô tả đầy đủ luồng nghiệp vụ Booking trên kiến trúc hiện tại — từ lúc Customer chọn gói đến khi Cashier đóng đơn — và map sang code thực tế.
+**Branch tham chiếu:** `main` (entity `Order` thống nhất Booking + Payment)
+**Last update:** 2026-05-19
 
-> Tài liệu này dùng để onboard người mới, làm spec test, và làm chuẩn so sánh khi build FE. Scope: **MVP shop nhỏ** — không over-engineer.
+> Tài liệu này dùng để onboard người mới, làm spec test, và làm chuẩn so sánh khi build FE. Scope: **MVP shop nhỏ**.
 
 ---
 
-## 1. Actors
+## 1. Kiến trúc — 1 entity duy nhất
+
+Trên branch `main`, **Booking và Payment hợp nhất thành 1 entity `Order`**. Không có collection `bookings` rời, không có `wash_sessions`, không có `inspections`. Mọi state của 1 lần rửa xe đều nằm trên `orders`.
+
+| Khái niệm cũ | Mapping trên main |
+|---|---|
+| `Booking` (lịch hẹn) | Cùng document `Order` |
+| `Order` (PayOS) | Cùng document `Order` (`payos_order_code`, `payos_checkout_url`) |
+| `WashSession` | Status trên `Order` (`checked_in` → `in_progress` → `completed`) |
+| `payment_status` ngoài | Cùng document `Order` (`payment_status`) |
+
+→ Khi cashier "đóng đơn" = `status='completed'` AND `payment_status='paid'`.
+
+---
+
+## 2. Actors
 
 | Role | Code | Ghi chú |
 |---|---|---|
 | Customer | `customer` | End user, tự đăng ký qua `POST /auth/register` |
-| Cashier | `cashier` | Thu ngân, mở phiên rửa, gán washer, xác nhận thanh toán |
-| Washer | `washer` | Người rửa xe, có queue riêng |
-| Manager | `manager` | Quản lý ca, có quyền cashier |
+| Cashier | `cashier` | Quản lý order tại counter: confirm, check-in, mark-paid (cash), update status |
+| Manager | `manager` | Có toàn quyền cashier |
 | Admin | `admin` | Toàn quyền |
+| ~~Washer~~ | — | **Không có washer role flow** ở phiên bản hiện tại. Cashier điều hướng order qua state thay tay. |
 
-Roles seed tự động khi app khởi động ([auth.module.ts:22-48](../src/features/auth/auth.module.ts#L22)).
+Roles seed tự động khi app khởi động ([auth.module.ts](../src/features/auth/auth.module.ts)).
 
 ---
 
-## 2. Happy path — Booking đặt trước (có lịch hẹn)
+## 3. Happy path — Online payment (PayOS)
 
 ### Bước 1 — Customer chọn gói + xe
 
-| Hành động | Endpoint | Bằng chứng |
-|---|---|---|
-| Xem danh sách gói rửa | `GET /service-types` | [service-type.controller.ts:11-17](../src/features/service-type/service-type.controller.ts#L11) |
-| Xem loại xe | `GET /vehicle-types` | [vehicle-type.controller.ts:11-20](../src/features/vehicle-type/vehicle-type.controller.ts#L11) |
-| Quản lý xe của mình | `GET/POST/PATCH /me/vehicles` | [vehicle.controller.ts](../src/features/vehicle/vehicle.controller.ts) |
+| Hành động | Endpoint |
+|---|---|
+| Xem danh sách gói rửa | `GET /service-types` |
+| Xem loại xe | `GET /vehicle-types` |
+| Quản lý xe của mình | `GET/POST/PATCH /me/vehicles` |
 
 **Quy tắc:**
 - `service_types.is_active=false` → không hiển thị public.
 - Vehicle ownership-protected: customer chỉ thấy xe của chính mình.
 - Xe mới đầu tiên auto-set `is_default=true`.
 
-### Bước 2 — Customer chọn ca + tạo booking
-
-```
-POST /me/bookings
-Role: JWT bất kỳ (default customer)
-Body: { vehicleId, serviceTypeId, staffShiftId, scheduledAt, note? }
-```
-
-**Validate** ([booking.service.ts:54-158](../src/features/booking/booking.service.ts#L54)):
-1. Vehicle thuộc customer + còn active.
-2. Service active.
-3. Shift còn `scheduled` (chưa active/completed/cancelled).
-4. `scheduledAt` nằm trong `[shift.start_at, shift.end_at]`.
-5. `scheduledAt + service.estimated_minutes ≤ shift.end_at` (không tràn cuối ca — D-05).
-6. `scheduledAt` ≥ hiện tại - 60s.
-7. `scheduledAt` ≤ `now + tier.booking_window_days` (BR-06).
-8. Customer chưa có quá `MAX_ACTIVE_PER_CUSTOMER` booking active (BR-08, default 3).
-9. Shift còn slot — atomic `$inc current_bookings` (BR-07).
-
-**Tạo:** `Booking{ status: 'pending', priority_level: tier.priority_level }`.
-
-**Rollback:** nếu create lỗi → release slot (`$inc -1`).
-
-### Bước 3 — Cashier xem + xác nhận booking
-
-```
-GET /admin/bookings?status=pending&customerPhone=...&vehicleLicensePlate=...
-Role: cashier, manager, admin
-```
-
-[admin-booking.controller.ts:33-43](../src/features/booking/admin-booking.controller.ts#L33). Search theo `customerPhone` (LIKE) hoặc `vehicleLicensePlate` (LIKE) — đáp ứng UX cashier tại counter ([booking.service.ts:298-324](../src/features/booking/booking.service.ts#L298)).
-
-```
-PATCH /admin/bookings/:id/status
-Body: { status: 'confirmed' }
-```
-
-State machine cho phép `pending → confirmed` ([booking.state-machine.ts:3-18](../src/features/booking/booking.state-machine.ts#L3)).
-
-### Bước 4 — Khách đến shop, Cashier mở phiên rửa
-
-```
-POST /admin/wash-sessions/from-booking
-Body: { bookingId, note? }
-Role: cashier, manager, admin
-```
-
-[admin-wash-session.controller.ts:40-55](../src/features/wash-session/admin-wash-session.controller.ts#L40), [wash-session.service.ts:48-95](../src/features/wash-session/wash-session.service.ts#L48).
-
-**Quy tắc:**
-- Booking phải ở `pending` hoặc `confirmed`.
-- 1 booking ↔ ≤1 wash_session (check trong service, return 409 nếu trùng).
-- Snapshot `service.base_price` vào `wash_session.service_price_snapshot` (phòng admin đổi giá sau).
-
-**Kết quả:** `wash_session` được tạo với `status='waiting'`, `cashier_id=actor`, `booking_id` link tới booking.
-
-> Bước này NGẦM hiểu là "cashier đã verify xe khớp booking + check-in". Không có endpoint check-in riêng — MVP không cần.
-
-### Bước 5 — (Tùy chọn) Cashier ghi nhận tình trạng xe (Inspection BEFORE)
-
-```
-POST /admin/wash-sessions/:sessionId/inspections
-Body: { phase: 'before', damageNotes?, customerSignatureUrl? }
-```
-
-[admin-inspection.controller.ts:35-57](../src/features/wash-session/admin-inspection.controller.ts#L35). Chỉ tạo được khi session ở `waiting` hoặc `assigned`.
-
-```
-POST /admin/inspections/:inspectionId/photos
-Body: { photoUrl, mime, size }
-```
-
-[admin-inspection-photo.controller.ts:34-48](../src/features/wash-session/admin-inspection-photo.controller.ts#L34). FE upload lên Cloudinary/S3 trước, truyền URL về.
-
-```
-PATCH /admin/inspections/:id/acknowledge
-Body: { customerSignatureUrl? }
-```
-
-Đánh dấu khách đã xác nhận tình trạng xe trước rửa.
-
-### Bước 6 — Cashier gán Washer
-
-```
-PATCH /admin/wash-sessions/:id/assign-washer
-Body: { washerId }
-```
-
-[admin-wash-session.controller.ts:97-114](../src/features/wash-session/admin-wash-session.controller.ts#L97), [wash-session.service.ts:134-162](../src/features/wash-session/wash-session.service.ts#L134).
-
-**Validate:**
-- Session ở `waiting`.
-- `washerId` là user có role=`washer` + `is_active=true`.
-
-**Kết quả:** session → `assigned`, lưu `washer_id`.
-
-### Bước 7 — Washer bắt đầu rửa
-
-```
-GET /me/washer/sessions?status=assigned
-PATCH /me/washer/sessions/:id/start
-```
-
-[washer-wash-session.controller.ts:34-67](../src/features/wash-session/washer-wash-session.controller.ts#L34).
-
-**Validate:**
-- Session phải đang assigned cho washer này (kiểm tra `session.washer_id === user.sub`, return 403 nếu khác).
-- Session phải ở `assigned`.
-
-**Kết quả:**
-- `wash_session.status = 'in_progress'`, `started_at = now`.
-- Auto-sync `booking.status = 'in_progress'` ([booking.service.ts:407-428](../src/features/booking/booking.service.ts#L407)).
-
-### Bước 8 — Washer hoàn tất
-
-```
-PATCH /me/washer/sessions/:id/complete
-```
-
-**Validate:** session ở `in_progress`.
-
-**Kết quả:**
-- `wash_session.status = 'done'`, `completed_at = now`.
-- Auto-sync `booking.status = 'done'` ([booking.service.ts:434-453](../src/features/booking/booking.service.ts#L434)).
-- Auto-release shift slot.
-
-### Bước 9 — (Tùy chọn) Inspection AFTER
-
-```
-POST /admin/wash-sessions/:sessionId/inspections
-Body: { phase: 'after', damageNotes? }
-```
-
-Chỉ tạo được khi session ở `done`. Để khách xác nhận xe ra không hư thêm gì.
-
-### Bước 10 — Cashier xác nhận thanh toán + đóng đơn ⚠ **CẦN BUILD**
-
-```
-PATCH /admin/bookings/:id/payment
-Body:
-  {
-    method: 'cash' | 'online',
-    finalPrice: number,            # VND, integer
-    orderId?: string               # bắt buộc nếu method=online
-  }
-Role: cashier, manager, admin
-```
-
-**Validate:**
-- Booking ở `status='done'`.
-- `booking.payment_status='unpaid'`.
-- Nếu `method='online'`: `Order.status='PAID'` và `Order.booking_id === bookingId`.
-
-**Kết quả:**
-- `booking.payment_status='paid'`
-- `booking.payment_method=method`
-- `booking.paid_at=now`
-- `booking.final_price=finalPrice`
-
-→ Đóng đơn = `status='done'` AND `payment_status='paid'`. KHÔNG cần state `CLOSED` riêng.
-
----
-
-## 3. Happy path — Walk-in (không booking trước)
-
-Khách đến shop trực tiếp, không đặt qua app.
-
-### Bước 1 — Customer đã có account + đã thêm xe vào hệ thống
-
-(Hoặc cashier tự tạo user qua `POST /admin/users` rồi thêm xe.)
-
-### Bước 2 — Cashier mở wash session trực tiếp
-
-```
-POST /admin/wash-sessions/walk-in
-Body: { customerId, vehicleId, serviceTypeId, note? }
-Role: cashier+
-```
-
-[admin-wash-session.controller.ts:57-74](../src/features/wash-session/admin-wash-session.controller.ts#L57), [wash-session.service.ts:97-132](../src/features/wash-session/wash-session.service.ts#L97).
-
-**Validate:** vehicle thuộc customer + active, service active.
-
-**Kết quả:** `wash_session{ booking_id: null, status: 'waiting', ... }`.
-
-### Bước 3+ — Giống flow đặt trước
-
-Assign washer → washer start → washer complete → cashier confirm payment.
-
-**Khác biệt khi đóng đơn:** walk-in không có booking → cần endpoint riêng hoặc tạo Booking ngầm. **MVP:** chấp nhận chỉ tạo `Order` (PayOS) hoặc ghi nhận tay; nếu cần báo cáo doanh thu thì cần backlog "auto-create booking từ walk-in session".
-
----
-
-## 4. Alternative flows / Edge cases
-
-### 4.1 Customer hủy booking
-
-```
-PATCH /me/bookings/:id/cancel
-Body: { reason? }
-```
-
-Chỉ cho phép từ `pending` hoặc `confirmed` ([booking.state-machine.ts:32-37](../src/features/booking/booking.state-machine.ts#L32)). Tự release shift slot.
-
-### 4.2 Customer đổi giờ booking
-
-```
-PATCH /me/bookings/:id/reschedule
-Body: { staffShiftId, scheduledAt }
-```
-
-[booking.service.ts:170-258](../src/features/booking/booking.service.ts#L170). Cap `MAX_RESCHEDULES=2`. Atomic: reserve slot mới trước, rồi release slot cũ.
-
-### 4.3 Cashier đánh dấu khách không đến
-
-```
-PATCH /admin/bookings/:id/status
-Body: { status: 'no_show', reason? }
-```
-
-Cho phép từ `pending` hoặc `confirmed`. Tự release slot.
-
-### 4.4 Cashier hủy wash session đang chạy
-
-```
-PATCH /admin/wash-sessions/:id/cancel
-Body: { reason? }
-```
-
-[admin-wash-session.controller.ts:116-130](../src/features/wash-session/admin-wash-session.controller.ts#L116). Cho phép từ `waiting`/`assigned`/`in_progress`. **LƯU Ý:** không tự cancel booking — cashier phải làm tay qua `PATCH /admin/bookings/:id/status`.
-
-### 4.5 Khách đến trễ, muốn đổi gói tại counter
-
-**MVP:** Cashier hủy booking cũ + tạo wash_session walk-in mới với gói khác. Không cần endpoint `switch-service` riêng.
-
-### 4.6 Khách đem xe khác đến
-
-**MVP:** Tương tự — hủy + walk-in mới. Hoặc cashier sửa `booking.vehicle_id` qua Mongo Atlas khi cần (hiếm).
-
-### 4.7 PayOS online payment
+### Bước 2 — Customer tạo order online
 
 ```
 POST /me/orders
-Body: { vehicleId, serviceTypeId, bookingId?, notes? }
+Role: JWT bất kỳ (default customer)
+Headers: Idempotency-Key (optional, 8-128 chars [A-Za-z0-9_-:.])
+Body: { vehicleId, serviceTypeId, scheduledAt, paymentMethod: 'online', note? }
 ```
 
-[payment.controller.ts:36-53](../src/features/payment/payment.controller.ts#L36). Trả về `checkoutUrl` để FE redirect sang PayOS.
+[order.controller.ts:37-63](../src/features/order/order.controller.ts#L37). Idempotency cache 24h theo header — retry trả về response cũ + header `Idempotent-Replayed=true`.
+
+**Validate** ([order.service.ts:69-217](../src/features/order/services/order.service.ts#L69)):
+1. Vehicle thuộc customer + còn active.
+2. Service active.
+3. `scheduledAt` ≥ hiện tại - 60s.
+4. `scheduledAt` ≤ `now + tier.booking_window_days` (BR-06).
+5. Customer chưa có quá `MAX_ACTIVE_BOOKINGS_PER_CUSTOMER` order ở status active (default 3, BR-08).
+6. **Server auto-pick shift** chứa `scheduledAt` và còn slot — atomic `$inc current_bookings`. Loop qua candidates phòng race condition.
+
+> ⚠ **Khác wash-sessions branch:** FE **KHÔNG** truyền `staffShiftId` khi tạo order. BE tự match.
+
+**Tạo Order:**
+- `status = 'pending_payment'`
+- `payment_status = 'unpaid'`
+- `payment_method = 'online'`
+- `amount = round(service.base_price)` — VND integer
+- `payos_order_code` = mã unique (Redis INCR + timestamp)
+- Gọi PayOS API → lưu `payos_checkout_url` + `payos_payment_link_id`
+
+**Response:** `OrderResponseDto` với `payosCheckoutUrl` để FE redirect.
+
+**Rollback** nếu PayOS lỗi → cancel order + release shift slot.
+
+**Email:** KHÔNG gửi confirmation ở bước này. Đợi webhook PAID.
+
+### Bước 3 — Customer thanh toán PayOS
+
+FE redirect sang `payos_checkout_url`. Customer thanh toán xong → PayOS gọi webhook về.
+
+### Bước 4 — Webhook PayOS xử lý
 
 ```
-POST /payments/webhook   (PayOS gọi, không auth)
+POST /payments/webhook   (PayOS gọi, public)
 ```
 
-[payment.controller.ts:99-108](../src/features/payment/payment.controller.ts#L99). Verify signature, update `Order.status`. **CẦN BUILD:** nếu Order có `booking_id`, auto-set `booking.payment_status='paid'`.
+[order.controller.ts:117-127](../src/features/order/order.controller.ts#L117), [order.service.ts:376-483](../src/features/order/services/order.service.ts#L376).
 
----
+**Idempotency 4 lớp:**
+1. Verify chữ ký PayOS.
+2. Redis SETNX trên `payos:txn:<reference>` TTL 30 ngày — dedup webhook replay.
+3. Redis per-order lock `lock:order:<orderCode>` TTL 10s.
+4. DB unique sparse index trên `payos_transaction_id`.
 
-## 5. State machines
+**Khi `code === '00'` (PAID):**
+- `Order.status` → `'confirmed'`
+- `Order.payment_status` → `'paid'`
+- Gửi email confirmation (await, không fire-and-forget — Vercel serverless).
+- Insert `payment_transactions` record.
 
-### Booking ([booking.state-machine.ts](../src/features/booking/booking.state-machine.ts))
-```
-pending ──┬─→ confirmed ──┬─→ in_progress ──→ done (terminal)
-          │               │
-          ├─→ cancelled (terminal)
-          └─→ no_show (terminal)
-```
+**Khi code khác (FAILED/CANCELLED):**
+- Release shift slot.
+- `Order.status` → `'cancelled'`, `cancel_reason = 'Payment failed'`.
 
-Transitions tự release shift slot khi đi từ active → terminal.
-
-### WashSession ([wash-session.state-machine.ts](../src/features/wash-session/wash-session.state-machine.ts))
-```
-waiting ──→ assigned ──→ in_progress ──→ done (terminal)
-   │           │              │
-   └─→ cancelled (any of 3 above)
-```
-
-Có hỗ trợ un-assign: `assigned → waiting`.
-
-### Order PayOS ([payment/entities/order.entity.ts:6-11](../src/features/payment/entities/order.entity.ts#L6))
-```
-PENDING ──┬─→ PAID
-          ├─→ CANCELLED
-          └─→ EXPIRED
-```
-
-### Payment terminal indicator (sau khi build fix MVP)
-```
-booking.status = 'done' AND booking.payment_status = 'paid'  →  ĐÓNG ĐƠN
-```
-
----
-
-## 6. Database entities
-
-Chi tiết schema xem [DB_SCHEMA_AS_BUILT.md](./DB_SCHEMA_AS_BUILT.md).
+### Bước 5 — Khách đến shop, Cashier check-in
 
 ```
-       ┌────────┐
-       │ users  │
-       └───┬────┘
-           │1:N
-           ├────────────────┬─────────────────┐
-           ▼                ▼                 ▼
-       ┌──────┐        ┌──────────┐      ┌─────────────┐
-       │vehic.│        │staff_shft│      │loyalty_acct │
-       └───┬──┘        └────┬─────┘      └──────┬──────┘
-           │N:1             │1:N                │N:1
-           ▼                ▼                   ▼
-       ┌──────────┐    ┌──────────┐       ┌────────────┐
-       │veh_types │    │ booking  │◀──────│tier_configs│
-       └──────────┘    └────┬─────┘       └────────────┘
-                            │1:1
-                            ▼
-                     ┌──────────────┐ N:1  ┌────────────┐
-                     │ wash_session │─────▶│ vehicle    │
-                     └──┬───────┬───┘      └────────────┘
-                        │1:N    │1:N
-                        ▼       ▼
-                ┌──────────┐ ┌────────┐ 1:N  ┌──────────────┐
-                │service_ty│ │inspect │─────▶│inspect_photos│
-                └──────────┘ └────────┘      └──────────────┘
-
-orders (PayOS) — chạy song song:
-  customer_id → users
-  service_type_id → service_types
-  vehicle_id → vehicles
-  ⚠ THIẾU booking_id (gap MVP P1 — xem §7)
-```
-
----
-
-## 7. MVP gap — Phải build
-
-**Vấn đề:** `Order` (PayOS) hiện không link `Booking` → cashier không có cách "đóng đơn" sau khi washer xong.
-
-**Fix tối thiểu — ước 1 ngày:**
-
-### 7.1 Schema changes
-
-**`Booking` thêm 4 field** ([booking/entities/booking.entity.ts](../src/features/booking/entities/booking.entity.ts)):
-```ts
-@Prop({ type: String, enum: ['unpaid','paid'], default: 'unpaid', index: true })
-payment_status: 'unpaid' | 'paid';
-
-@Prop({ type: String, enum: ['cash','online'] })
-payment_method?: 'cash' | 'online';
-
-@Prop()
-paid_at?: Date;
-
-@Prop({ type: Types.Decimal128 })
-final_price?: Types.Decimal128;
-```
-
-**`Order` thêm 1 field** ([payment/entities/order.entity.ts](../src/features/payment/entities/order.entity.ts)):
-```ts
-@Prop({ type: Types.ObjectId, ref: 'Booking', sparse: true, unique: true, index: true })
-booking_id?: Types.ObjectId;
-```
-
-### 7.2 DTO changes
-
-`CreateOrderDto` thêm optional `bookingId?: string`. Khi tạo, lưu vào `Order.booking_id` nếu có.
-
-### 7.3 Endpoint mới
-
-```
-PATCH /admin/bookings/:id/payment
+PATCH /admin/orders/:id/status
+Body: { status: 'checked_in' }
 Role: cashier, manager, admin
-Body:
-  {
-    method: 'cash' | 'online',
-    finalPrice: number,
-    orderId?: string             # required if method='online'
-  }
-Response: BookingResponseDto (includes payment_status, payment_method, paid_at, final_price)
-
-Business rules:
-  - booking.status must be 'done'
-  - booking.payment_status must be 'unpaid'
-  - if method='online': Order.status must be 'PAID' AND Order.booking_id === bookingId
-  - SET: payment_status='paid', payment_method=method, paid_at=now, final_price=finalPrice
 ```
 
-### 7.4 PayOS webhook auto-sync
+[admin-order.controller.ts:58-72](../src/features/order/admin-order.controller.ts#L58).
 
-Trong [payment.service.ts:handleWebhook](../src/features/payment/payment.service.ts#L172), khi `code === '00'` (PAID), nếu `order.booking_id` có → tự gọi internal method để set `booking.payment_status='paid'`, `payment_method='online'`, `paid_at=now`, `final_price=order.amount`.
+**Quy tắc:** Order phải ở `confirmed`. State machine ([order.state-machine.ts:11-15](../src/features/order/order.state-machine.ts#L11)).
 
-### 7.5 Test plan
+> Bước này NGẦM hiểu là "cashier đã verify xe khớp order + check-in". Không có endpoint check-in riêng.
 
-1. Tạo booking → confirm → mở wash_session → assign washer → start → complete.
-2. Cashier gọi `/payment` với `method=cash` → booking đóng đơn.
-3. Lặp lại nhưng `method=online`: customer thanh toán PayOS trước → webhook → cashier verify orderId.
-4. Negative: gọi `/payment` khi booking chưa done → 400.
+### Bước 6 — Bắt đầu rửa
+
+```
+PATCH /admin/orders/:id/status
+Body: { status: 'in_progress' }
+```
+
+Cashier nhấn khi nhân viên bắt đầu rửa. State machine cho phép `checked_in → in_progress`.
+
+### Bước 7 — Hoàn tất
+
+```
+PATCH /admin/orders/:id/status
+Body: { status: 'completed' }
+```
+
+Terminal state. Shift slot tự release (vì `completed` không nằm trong `ACTIVE_ORDER_STATUSES`).
+
+→ **Đóng đơn** = `status='completed'` AND `payment_status='paid'`. Với online flow đã `paid` từ Bước 4, không cần làm gì thêm.
+
+---
+
+## 4. Happy path — Cash payment
+
+### Bước 1-2 giống online, nhưng:
+
+```
+POST /me/orders
+Body: { vehicleId, serviceTypeId, scheduledAt, paymentMethod: 'cash', note? }
+```
+
+**Khác online:**
+- `status = 'confirmed'` ngay (không qua `pending_payment` vì không cần đợi PayOS).
+- `payment_status = 'unpaid'`.
+- KHÔNG tạo PayOS link.
+- Email confirmation gửi NGAY ở bước create.
+
+### Bước 3 — Khách đến, cashier check-in → in_progress → completed
+
+Giống Bước 5-7 ở §3.
+
+### Bước 4 — Cashier thu tiền mặt và mark paid
+
+```
+POST /admin/orders/:id/mark-paid
+Role: cashier, manager, admin
+```
+
+[admin-order.controller.ts:74-87](../src/features/order/admin-order.controller.ts#L74), [order.service.ts:592-612](../src/features/order/services/order.service.ts#L592).
+
+**Validate:**
+- `payment_method === 'cash'` (online không được mark tay).
+- Idempotent — nếu đã `paid` trả về luôn không lỗi.
+
+**Kết quả:** `payment_status = 'paid'`.
+
+→ **Đóng đơn** = `status='completed'` AND `payment_status='paid'`.
+
+> 💡 **Thời điểm mark-paid linh hoạt:** có thể gọi trước, sau, hoặc song song với chuỗi `checked_in → in_progress → completed`. Không có ràng buộc status để gọi `/mark-paid`.
+
+---
+
+## 5. Alternative flows / Edge cases
+
+### 5.1 Customer hủy order
+
+```
+PATCH /me/orders/:id/cancel
+Body: { reason? }
+```
+
+[order.service.ts:326-365](../src/features/order/services/order.service.ts#L326).
+
+Chỉ cho phép từ `pending_payment` hoặc `confirmed` ([order.state-machine.ts:39-44](../src/features/order/order.state-machine.ts#L39)).
+
+**Side effects:**
+- Nếu online + còn `pending_payment` → cancel PayOS link best-effort.
+- Release shift slot (nếu status còn consume).
+- `status = 'cancelled'`, `cancel_reason`.
+
+### 5.2 Customer đổi giờ order
+
+```
+PATCH /me/orders/:id/reschedule
+Body: { staffShiftId, scheduledAt }
+```
+
+[order.service.ts:245-324](../src/features/order/services/order.service.ts#L245).
+
+**Khác create:** ở đây FE **PHẢI** truyền `staffShiftId` (vì user chủ động chọn shift mới qua UI).
+
+**Quy tắc:**
+- Chỉ cho phép từ `pending_payment` hoặc `confirmed`.
+- Cap `MAX_RESCHEDULES=2` (env).
+- Atomic: reserve slot mới trước, rồi release slot cũ. Rollback nếu fail giữa chừng.
+- `scheduledAt + service.estimated_minutes ≤ newShift.end_at`.
+
+### 5.3 Cashier đánh dấu khách không đến (no-show)
+
+```
+PATCH /admin/orders/:id/status
+Body: { status: 'no_show', reason? }
+```
+
+Cho phép từ `confirmed` hoặc `checked_in`. Tự release shift slot.
+
+### 5.4 Cashier hủy order (trước khi rửa)
+
+```
+PATCH /admin/orders/:id/status
+Body: { status: 'cancelled', reason? }
+```
+
+**Chỉ cho phép từ `pending_payment`, `confirmed`, hoặc `checked_in`** ([order.state-machine.ts:6-25](../src/features/order/order.state-machine.ts#L6)).
+
+⚠ **Không cancel được order đang `in_progress`** — state machine chỉ cho `in_progress → completed`. Nếu thật sự cần dừng giữa chừng, hiện tại phải sửa tay qua Mongo Atlas hoặc backlog cho phép `in_progress → cancelled` (xem §8).
+
+Tự release shift slot khi vào terminal.
+
+### 5.5 PayOS payment timeout
+
+Cron `OrderExpiryCron` ([jobs/order-expiry.cron.ts](../src/features/order/jobs/order-expiry.cron.ts)) chạy **mỗi phút**:
+- Tìm order `status='pending_payment'` có `created_at < now - paymentTimeoutMinutes` (default 15 phút).
+- Set `cancelled` + `cancel_reason='Payment timeout'`.
+- Release shift slot + cancel PayOS link best-effort.
+
+### 5.5b Cash no-show timeout
+
+Cron `CashNoShowCron` ([jobs/cash-no-show.cron.ts](../src/features/order/jobs/cash-no-show.cron.ts)) chạy **mỗi phút**:
+- Tìm order `status='confirmed'` AND `payment_method='cash'` AND `payment_status='unpaid'` có `scheduled_at < now - cashArrivalGraceMinutes` (default 30 phút sau giờ hẹn).
+- Set `no_show` + `cancel_reason='No arrival within grace window'`.
+- Release shift slot.
+
+→ Đóng gap "cash order chiếm slot vĩnh viễn nếu khách không đến". Cashier vẫn có thể chủ động chuyển `no_show` sớm hơn qua `PATCH /admin/orders/:id/status` trước khi cron sweep.
+
+**Env**: `CASH_ARRIVAL_GRACE_MINUTES` (5-240, default 30).
+
+### 5.6 Webhook đến sau khi cron đã expire
+
+Webhook check `order.status === 'pending_payment'` trước khi update ([order.service.ts:430-452](../src/features/order/services/order.service.ts#L430)). Nếu đã `cancelled` (do cron timeout), bỏ qua state update — chỉ ghi `payment_transactions` audit log.
+
+⚠ **Edge case nghiêm trọng:** customer click thanh toán đúng lúc cron 15 phút cancel order. Webhook PAID đến muộn → tiền đã trừ nhưng order đã `cancelled` → **không tự refund**. Hiện tại phải xử lý tay:
+1. Kiểm tra `payment_transactions` để xác nhận đã nhận tiền (`status` từ webhook PayOS).
+2. Refund tay qua PayOS dashboard, hoặc tạo lại order rồi mark-paid + đánh dấu nội bộ.
+
+Cách giảm rủi ro: tăng `BOOKING_PAYMENT_TIMEOUT_MINUTES` (default 15) — nhưng cũng giữ shift slot lâu hơn. Hoặc backlog: webhook PAID đến muộn → auto un-cancel + paid + flag.
+
+→ Trade-off này KHÔNG ghi trong code, không có warning ở runtime. FE nên hiển thị countdown để khách thấy.
+
+### 5.7 Cashier search tại counter
+
+```
+GET /admin/orders
+  ?customerPhone=0901
+  &vehicleLicensePlate=51A
+  &status=confirmed
+  &paymentStatus=unpaid
+  &paymentMethod=cash
+  &scheduledFrom=2026-06-01
+  &scheduledTo=2026-06-30
+  &page=1&limit=20
+```
+
+[admin-order.controller.ts:39-48](../src/features/order/admin-order.controller.ts#L39), [order.service.ts:487-535](../src/features/order/services/order.service.ts#L487).
+
+Search `customerPhone` / `vehicleLicensePlate` là substring case-insensitive — phù hợp UX cashier gõ vài số đầu của SĐT hoặc biển số.
+
+### 5.8 Khách walk-in (không booking trước)
+
+**Hiện tại KHÔNG hỗ trợ trực tiếp.** Tất cả order phải do customer tạo qua `POST /me/orders`. Workaround:
+1. Cashier giúp khách register (`POST /auth/register`) hoặc tạo user qua admin endpoint.
+2. Khách tự (hoặc cashier dùng JWT khách) tạo order với `scheduledAt = now`.
+3. Cashier confirm + check-in ngay.
+
+→ Nếu use case walk-in nhiều, cần build endpoint `POST /admin/orders/walk-in` riêng (xem §8 Backlog).
+
+### 5.9 Khách đổi gói/đổi xe tại counter
+
+Hiện tại không có endpoint `switch-service` / `switch-vehicle`. Workaround: cashier set `cancelled` order cũ, customer tạo lại order mới.
+
+### 5.10 Idempotent order creation
+
+`POST /me/orders` chấp nhận header `Idempotency-Key` (8-128 chars [A-Za-z0-9_-:.]):
+- Lần đầu: tạo order như bình thường, cache response 24h.
+- Lần sau cùng key: trả response cache + header `Idempotent-Replayed=true`. Không tạo order trùng.
+
+Phòng trường hợp FE retry do mạng chập chờn, đặc biệt khi đã có PayOS link.
+
+---
+
+## 6. State machine ([order.state-machine.ts](../src/features/order/order.state-machine.ts))
+
+```
+                                        ┌────────────┐
+                                        ▼            │
+pending_payment ──→ confirmed ──→ checked_in ──→ in_progress ──→ completed (terminal)
+       │                │              │
+       └──→ cancelled   └──→ cancelled └──→ cancelled              (terminal)
+       └─ (auto-expire  └──→ no_show   └──→ no_show                (terminal)
+           15 min →
+           cancelled)
+```
+
+**Transitions hợp lệ (tổng kết):**
+
+| Từ | Sang |
+|---|---|
+| `pending_payment` | `confirmed`, `cancelled` |
+| `confirmed` | `checked_in`, `cancelled`, `no_show` |
+| `checked_in` | `in_progress`, `cancelled`, `no_show` |
+| `in_progress` | `completed` (KHÔNG cho cancel/no_show — xem §5.4) |
+| `completed` / `cancelled` / `no_show` | terminal |
+
+**Active statuses (consume shift capacity):** `pending_payment`, `confirmed`, `checked_in`, `in_progress`. Khi transition ra terminal → atomic `$inc current_bookings -1`.
+
+**Terminal:** `completed`, `cancelled`, `no_show`.
+
+**Payment status (orthogonal):**
+```
+unpaid ──→ paid  (online: via webhook; cash: via /mark-paid)
+       ──→ refunded (chưa có flow, để backlog)
+```
+
+---
+
+## 7. Entity `orders` — Field reference
+
+[order.entity.ts](../src/features/order/entities/order.entity.ts). Tất cả field đều trên 1 document duy nhất:
+
+### Relationships
+- `customer_id` → users (required, IX)
+- `vehicle_id` → vehicles (required, IX)
+- `service_type_id` → service_types (required, IX)
+- `staff_shift_id` → staff_shifts (required, IX)
+
+### Scheduling
+- `scheduled_at` Date (required)
+- `status` enum (required, IX, default `pending_payment`)
+- `priority_level` Number (default 0) — snapshot từ `tier.priority_level` lúc tạo
+- `reschedule_count` Number (default 0)
+- `cancel_reason` String (optional)
+- `note` String (optional) — customer note cho staff
+
+### Payment
+- `payment_method` enum `'online' | 'cash'` (required)
+- `payment_status` enum `'unpaid' | 'paid' | 'refunded'` (required, IX, default `unpaid`)
+- `amount` Number (required, VND integer)
+- `payos_order_code` Number (unique sparse, IX) — chỉ có với online
+- `payos_checkout_url` String (optional)
+- `payos_payment_link_id` String (optional)
+
+### Indexes
+- `{ customer_id: 1, scheduled_at: -1 }` compound
+- `{ scheduled_at: 1, status: 1 }` compound
+- `{ customer_id: 1, status: 1 }` compound
 
 ---
 
@@ -437,21 +391,58 @@ Trong [payment.service.ts:handleWebhook](../src/features/payment/payment.service
 
 | Thứ | Khi nào cần |
 |---|---|
-| `wash_steps` collection (pre_wash/exterior/interior/drying/final_check) | Khi shop muốn track productivity từng bước |
-| `status_history` polymorphic audit log | Khi cần báo cáo audit / compliance |
-| Booking status `QUALITY_CHECK`, `NEEDS_REWORK` | Khi gặp khách phàn nàn nhiều, cần loop rework |
-| Booking status `REFUNDED` | Khi có chính sách hoàn tiền |
-| `vehicle_types.price_multiplier` | Khi muốn 1 service áp nhiều loại xe với giá khác |
-| Endpoint `switch-service` / `switch-vehicle` tại counter | Khi case đổi gói/đổi xe xảy ra thường xuyên |
-| Inspection BEFORE bắt buộc gate (washer không start được nếu chưa có) | Khi có vấn đề pháp lý về damage claim |
-| Walk-in tự tạo Booking ngầm | Khi cần báo cáo doanh thu thống nhất |
+| Walk-in endpoint `POST /admin/orders/walk-in` | Khi shop có nhiều khách không đặt trước |
+| Washer role flow + assign-washer endpoint | Khi cần track productivity từng washer |
+| Inspection (before/after photos + signature) | Khi cần damage claim defense |
+| Status `refunded` + refund flow | Khi có chính sách hoàn tiền |
+| Tier `discount_percent` áp dụng vào `amount` | Hiện chưa apply discount vào pricing |
+| Loyalty points earn khi `paid` | Hiện chưa award points sau payment |
+| `visits_this_month` increment | Hiện chưa cập nhật loyalty visits |
+| ~~Auto-expire `confirmed` cash orders quá hạn~~ | ✅ Đã build — `CashNoShowCron` sweep mỗi phút, env `CASH_ARRIVAL_GRACE_MINUTES` |
+| Switch-service / switch-vehicle tại counter | Khi case đổi xảy ra thường xuyên |
 | Cash session quản lý ca thu ngân | Khi nhiều cashier làm việc cùng lúc |
 
 ---
 
-## 9. Tham chiếu
+## 9. Gap nghiệp vụ cần lưu ý
 
-- Schema: [DB_SCHEMA_AS_BUILT.md](./DB_SCHEMA_AS_BUILT.md)
-- Status: [IMPLEMENTATION_STATUS.md](./IMPLEMENTATION_STATUS.md)
-- Audit gốc: [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md)
-- Branch: `feature/wash-sessions` @ commit `31e67a2`
+1. **Loyalty chưa wire vào Order flow.** `tier_configs` đã có `points_per_1000_vnd` và `discount_percent`, nhưng `Order.amount` lấy thẳng `base_price` không trừ discount, và không có hook nào award points khi `payment_status='paid'`. Khi build Phase Loyalty, hook vào webhook + `/mark-paid`.
+
+2. ~~Cash order không có timeout.~~ ✅ Đã build (2026-05-19) — `CashNoShowCron` sweep `confirmed` + `cash` + `unpaid` có `scheduled_at < now - cashArrivalGraceMinutes` → `no_show` + release slot.
+
+3. **Status transition không gửi notification.** Khi cashier check-in / completed, customer không nhận thông báo. Chỉ có 1 email duy nhất ở thời điểm `confirmed`.
+
+4. **Không có audit log status transition.** Khi cần báo cáo sau, không trace được ai/khi nào thay đổi status. Backlog: `order_status_history` collection.
+
+---
+
+## 10. Test plan (manual)
+
+### Cash flow
+1. `POST /me/orders` với `paymentMethod=cash` → 201, status=`confirmed`, payment_status=`unpaid`, email gửi.
+2. `PATCH /admin/orders/:id/status` { checked_in } → 200.
+3. `PATCH /admin/orders/:id/status` { in_progress } → 200.
+4. `PATCH /admin/orders/:id/status` { completed } → 200. Shift slot release.
+5. `POST /admin/orders/:id/mark-paid` → 200, payment_status=`paid`.
+
+### Online flow
+1. `POST /me/orders` với `paymentMethod=online` → 201, status=`pending_payment`, payosCheckoutUrl có.
+2. Mở `payosCheckoutUrl`, thanh toán test.
+3. Đợi webhook → order chuyển `confirmed`+`paid`, email gửi.
+4. Lặp các step admin → `completed`.
+
+### Negative
+- Tạo order khi đã có 3 active → 400 "limit 3".
+- Reschedule lần 3 → 400 "Reschedule limit reached".
+- Cancel order ở `in_progress` (customer) → 400.
+- Webhook signature sai → silently dropped (log warn).
+- `mark-paid` order online → 400.
+
+---
+
+## 11. Tham chiếu
+
+- Schema: [DB_SCHEMA_AS_BUILT.md](./DB_SCHEMA_AS_BUILT.md) — ⚠ phần Booking/wash_sessions đã obsolete, đọc §13 (`orders`).
+- Audit cũ trên wash-sessions: [BUSINESS_FLOW_AUDIT.md](./BUSINESS_FLOW_AUDIT.md) — đã ARCHIVED, gap MVP đó giải quyết khác trên main.
+- Booking config: [booking.config.ts](../src/config/booking.config.ts).
+- Branch: `main` @ commit `046bc66` (hotfix/cors-wave-wash dựa trên main).
